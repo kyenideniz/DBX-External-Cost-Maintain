@@ -1,0 +1,544 @@
+import fs from 'fs';
+import path from 'path';
+import {
+  AuditLogEntry,
+  ImportedTransaction,
+  MonthCloseConfirmation,
+  MonthlySnapshot,
+  Project,
+  ReviewWarning,
+  User,
+  VendorAlias,
+} from '../src/types.js';
+import { parseCJI3Excel, classifyRow } from './parser.js';
+import * as XLSX from 'xlsx';
+import { resolveProjectName } from '../src/utils/wbsMap.js';
+import {
+  findPlaniswareSourceFile,
+  parsePlaniswareExport,
+  applyPlaniswareMapping,
+  TARGET_PLANISWARE_FILE,
+} from './planiswareSource.js';
+
+
+// TODO [Databricks Apps / Persistence]: The container filesystem is ephemeral and resets on redeployment or restart.
+// For production persistence in Databricks Apps, migrate data/db.json storage to a managed database
+// (e.g., Azure PostgreSQL / Databricks Lakehouse / SQL), Unity Catalog Volume, or external object storage (Azure Blob / S3).
+const DATA_DIR = path.join(process.cwd(), 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+
+export interface AppDatabase {
+  users: User[];
+  projects: Project[];
+  vendorAliases: VendorAlias[];
+  snapshots: MonthlySnapshot[];
+  transactions: ImportedTransaction[];
+  subtotalRows: any[];
+  monthCloseConfirmations: MonthCloseConfirmation[];
+  auditLogs: AuditLogEntry[];
+  warnings: ReviewWarning[];
+}
+
+// Initial Users
+const initialUsers: User[] = [
+  { id: 'usr-admin', name: 'Alexander Wright (Admin)', email: 'admin@company.com', role: 'admin' },
+  { id: 'usr-pm-sarah', name: 'Sarah Jenkins (PM)', email: 'sarah.pm@company.com', role: 'pm' },
+  { id: 'usr-pm-david', name: 'David Chen (PM)', email: 'david.pm@company.com', role: 'pm' },
+];
+
+// Initial Projects
+const initialProjects: Project[] = [
+  { wbs: 'P-1001-CAPEX', name: 'Cloud Infrastructure Modernization', projectType: 'CAPEX', assignedPmId: 'usr-pm-sarah', assignedPmName: 'Sarah Jenkins (PM)', budgetEUR: 250000 },
+  { wbs: 'P-1002-CAPEX', name: 'Data Center Core Network Refresh', projectType: 'CAPEX', assignedPmId: 'usr-pm-sarah', assignedPmName: 'Sarah Jenkins (PM)', budgetEUR: 180000 },
+  { wbs: 'P-1003-CAPEX', name: 'SAP S/4HANA Enterprise Migration', projectType: 'CAPEX', assignedPmId: 'usr-pm-david', assignedPmName: 'David Chen (PM)', budgetEUR: 350000 },
+  { wbs: 'P-1004-CAPEX', name: 'Planisware Integration & Analytics', projectType: 'CAPEX', assignedPmId: 'usr-pm-david', assignedPmName: 'David Chen (PM)', budgetEUR: 120000 },
+];
+
+// Initial Vendor Aliases
+const initialAliases: VendorAlias[] = [
+  { id: 'alias-1', rawPattern: 'SAP BELGIUM N', canonicalVendor: 'SAP BELGIUM NV', notes: 'Truncated SAP Belgium entity' },
+  { id: 'alias-2', rawPattern: 'PLANISWARE BELGIUM SR', canonicalVendor: 'PLANISWARE BELGIUM SRL', notes: 'Planisware local entity' },
+  { id: 'alias-3', rawPattern: 'ERNST & YOUNG CONSUL', canonicalVendor: 'ERNST & YOUNG CONSULTING', notes: 'EY Consulting truncation' },
+  { id: 'alias-4', rawPattern: 'ERNST & YOUNG CONSULTI', canonicalVendor: 'ERNST & YOUNG CONSULTING', notes: 'EY Consulting truncation 2' },
+  { id: 'alias-5', rawPattern: 'ERNST & YOUNG CONSULTIN', canonicalVendor: 'ERNST & YOUNG CONSULTING', notes: 'EY Consulting truncation 3' },
+  { id: 'alias-6', rawPattern: 'FLEXSO SUPPLY CHAI', canonicalVendor: 'FLEXSO SUPPLY CHAIN NV', notes: 'Flexso partner truncation' },
+];
+
+class Store {
+  private db: AppDatabase;
+
+  constructor() {
+    this.db = this.loadDatabase();
+
+    // Re-run classifyRow on stored transactions to enforce updated internal mandays & reclass rules
+    if (this.db.transactions && this.db.transactions.length > 0) {
+      this.db.transactions.forEach((tx) => {
+        if (!tx.userOverride) {
+          tx.classification = classifyRow(tx.purchasingDoc, tx.nameDescription, tx.costElemDesc, tx.costElement, tx.rawVendor);
+        }
+      });
+    }
+
+    const checkForWebAppPath = path.join(process.cwd(), 'checkforwebapp.xlsx');
+    if (
+      this.db.snapshots.length === 0 ||
+      this.db.projects.length < 100 ||
+      (fs.existsSync(checkForWebAppPath) && (!this.db.snapshots[0]?.filename || !this.db.snapshots[0].filename.includes('checkforwebapp')))
+    ) {
+      this.seedInitialSnapshots();
+    }
+
+    // Load new actual spendings export (CJI_export_01-11-2026.xlsx) while preserving baseline
+    this.syncNewCJIExport();
+
+    // Automatically synchronize project names and codes from Planisware export source
+    this.syncPlaniswareMapping();
+  }
+
+  public getBaselineTransactions(): ImportedTransaction[] {
+    const baselineSnap = this.db.snapshots.find(
+      (s) =>
+        s.id === 'snap-source-excel-v1' ||
+        s.id === 'snap-baseline-v1' ||
+        s.filename.includes('checkforwebapp') ||
+        s.filename.includes('capex-export-CJI3')
+    );
+    if (baselineSnap) {
+      return this.db.transactions.filter((t) => t.snapshotId === baselineSnap.id);
+    }
+    return [];
+  }
+
+  public syncNewCJIExport() {
+    const newFilePath = path.join(process.cwd(), 'CJI_export_01-11-2026.xlsx');
+    if (!fs.existsSync(newFilePath)) return;
+
+    const snapId = 'snap-2026-10-v1';
+    const filename = 'CJI_export_01-11-2026.xlsx';
+    const alreadyLoaded = this.db.snapshots.some((s) => s.id === snapId || s.filename === filename);
+    if (alreadyLoaded && this.db.transactions.some((t) => t.snapshotId === snapId)) {
+      return;
+    }
+
+    try {
+      console.log(`Loading new actual spendings file: ${filename}...`);
+      const fileBuf = fs.readFileSync(newFilePath);
+      const parsed = parseCJI3Excel(fileBuf, snapId, filename, this.db.vendorAliases, 'Sheet1');
+
+      // Keep existing transactions from other snapshots (such as snap-source-excel-v1 baseline)
+      this.db.transactions = this.db.transactions.filter((t) => t.snapshotId !== snapId);
+      this.db.transactions.push(...parsed.detailRows);
+
+      // Add or update snapshot record
+      const existingSnapIndex = this.db.snapshots.findIndex((s) => s.id === snapId);
+      const snapshot: MonthlySnapshot = {
+        id: snapId,
+        reportingMonth: '2026-10',
+        version: 1,
+        status: 'COMMITTED',
+        filename,
+        uploadedBy: 'usr-admin',
+        uploadedAt: new Date().toISOString(),
+        totalRows: parsed.summary.totalRows,
+        detailRowsCount: parsed.detailRows.length,
+        subtotalRowsCount: parsed.summary.subtotalCount,
+        wbsCount: parsed.summary.wbsCount,
+        vendorCount: parsed.summary.vendorCount,
+        totalExternalSpend: parsed.summary.totalExternalSpend,
+        totalInternalReclass: parsed.summary.totalInternalReclass,
+        totalCorrectionTransfer: parsed.summary.totalCorrectionTransfer,
+        totalOtherNonPo: parsed.summary.totalOtherNonPo,
+      };
+
+      if (existingSnapIndex >= 0) {
+        this.db.snapshots[existingSnapIndex] = snapshot;
+      } else {
+        this.db.snapshots.push(snapshot);
+      }
+
+      // Add any missing projects from this new extract to db.projects
+      const existingWbs = new Set(this.db.projects.map((p) => p.wbs));
+      parsed.detailRows.forEach((tx) => {
+        const rawWbs = tx.normalizedWbs || tx.wbs;
+        if (!rawWbs) return;
+        const parts = rawWbs.split('/');
+        const baseCode = parts.length >= 2 ? parts.slice(0, 2).join('/') : rawWbs;
+        const isOpex = baseCode.startsWith('C') || baseCode.startsWith('C7941/');
+
+        if (!existingWbs.has(baseCode)) {
+          existingWbs.add(baseCode);
+          const type = isOpex ? 'OPEX' : 'CAPEX';
+          const defaultTxName = tx.nameDescription
+            ? tx.nameDescription.split('/')[1] || tx.nameDescription.split('/')[0]
+            : `${type} Project ${baseCode}`;
+          this.db.projects.push({
+            wbs: baseCode,
+            name: resolveProjectName(baseCode, defaultTxName),
+            projectType: type,
+            assignedPmId: 'usr-pm-sarah',
+            assignedPmName: 'Sarah Jenkins (PM)',
+            budgetEUR: 350000,
+          });
+        }
+      });
+
+      this.save();
+      console.log(`Loaded new actual spendings extract ${filename}: ${parsed.detailRows.length} transactions across ${this.db.projects.length} total projects.`);
+    } catch (err) {
+      console.error(`Error loading ${filename}:`, err);
+    }
+  }
+
+  public syncPlaniswareMapping(overrideFilePath?: string): { updatedProjectsCount: number; totalMapped: number; filename: string } {
+    const sourceInfo = overrideFilePath
+      ? { filePath: overrideFilePath, filename: path.basename(overrideFilePath), isTargetFile: path.basename(overrideFilePath) === TARGET_PLANISWARE_FILE }
+      : findPlaniswareSourceFile();
+
+    if (sourceInfo.filePath && fs.existsSync(sourceInfo.filePath)) {
+      try {
+        console.log(`Loading project codes & names from Planisware source: ${sourceInfo.filename}...`);
+        const parsed = parsePlaniswareExport(sourceInfo.filePath, sourceInfo.filename);
+        if (parsed.totalParsed > 0) {
+          const res = applyPlaniswareMapping(
+            parsed.mapping,
+            parsed.projects,
+            sourceInfo.filename,
+            this.db.projects,
+            () => this.save()
+          );
+          console.log(`Planisware project source loaded: ${res.totalMapped} codes mapped, updated ${res.updatedProjectsCount} project entries.`);
+          return { updatedProjectsCount: res.updatedProjectsCount, totalMapped: res.totalMapped, filename: sourceInfo.filename };
+        }
+      } catch (err) {
+        console.warn(`Failed loading Planisware project source from ${sourceInfo.filename}:`, err);
+      }
+    }
+    return { updatedProjectsCount: 0, totalMapped: 0, filename: sourceInfo.filename };
+  }
+
+  private loadDatabase(): AppDatabase {
+
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+
+      if (fs.existsSync(DB_FILE)) {
+        const raw = fs.readFileSync(DB_FILE, 'utf-8');
+        return JSON.parse(raw);
+      }
+    } catch (e) {
+      console.error('Error reading db.json, re-initializing database:', e);
+    }
+
+    return {
+      users: initialUsers,
+      projects: initialProjects,
+      vendorAliases: initialAliases,
+      snapshots: [],
+      transactions: [],
+      subtotalRows: [],
+      monthCloseConfirmations: [],
+      auditLogs: [
+        {
+          id: 'log-1',
+          timestamp: new Date().toISOString(),
+          userId: 'usr-admin',
+          userName: 'Alexander Wright',
+          action: 'SYSTEM_INIT',
+          target: 'Database',
+          details: 'Initialized Planisware CAPEX system database with seed configuration.',
+        },
+      ],
+      warnings: [],
+    };
+  }
+
+  public save() {
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      fs.writeFileSync(DB_FILE, JSON.stringify(this.db, null, 2), 'utf-8');
+    } catch (e) {
+      console.error('Failed to write db.json:', e);
+    }
+  }
+
+  public getDB(): AppDatabase {
+    return this.db;
+  }
+
+  /**
+   * Helper to build sample CJI3 Excel file buffer for Month 1 (August 2026) and Month 2 (September 2026)
+   */
+  public createSampleCJI3Buffer(monthStr: '2026-08' | '2026-09'): Buffer {
+    const isM1 = monthStr === '2026-08';
+
+    const headers = [
+      'WBS Element',
+      'Document Date',
+      'Object',
+      'Cost Element',
+      'Purchasing Document',
+      'Value in Object Currency',
+      'Value in Transaction Currency',
+      'CO Area Currency',
+      'Transaction Currency',
+      'Name / vendor or accounting description',
+      'Reference Fiscal Year',
+      'From Period',
+      'Cost Element Description',
+      'Posting Date',
+    ];
+
+    let rows: any[][] = [headers];
+
+    if (isM1) {
+      // Month 1 - August 2026
+      rows.push(
+        // P-1001-CAPEX
+        ['P-1001-CAPEX', '2026-08-05', 'WBS P-1001', '500100', '45001001', 15000, 15000, 'EUR', 'EUR', 'SAP BELGIUM N / Inv 9812', '2026', '08', 'External Services', '2026-08-05'],
+        ['P-1001-CAPEX', '2026-08-12', 'WBS P-1001', '500100', '45001002', 8500, 8500, 'EUR', 'EUR', 'PLANISWARE BELGIUM SR / License A', '2026', '08', 'External Software', '2026-08-12'],
+        ['P-1001-CAPEX', '2026-08-20', 'WBS P-1001', '500200', '', 4200, 4200, 'EUR', 'EUR', 'Reclass internal hours from OPEX to Capex', '2026', '08', 'Internal Hours Reclass', '2026-08-20'],
+        ['P-1001-CAPEX', '', '', '', '', 27700, 27700, '', '', '', '', '', '', ''], // Subtotal row
+
+        // P-1002-CAPEX
+        ['P-1002-CAPEX', '2026-08-10', 'WBS P-1002', '500100', '45002001', 12000, 12000, 'EUR', 'EUR', 'ERNST & YOUNG CONSUL / Audit Services', '2026', '08', 'Consulting', '2026-08-10'],
+        ['P-1002-CAPEX', '2026-08-15', 'WBS P-1002', '500100', '45002002', 6000, 6000, 'EUR', 'EUR', 'FLEXSO SUPPLY CHAI / Module Config', '2026', '08', 'Implementation', '2026-08-15'],
+        ['P-1002-CAPEX', '', '', '', '', 18000, 18000, '', '', '', '', '', '', ''], // Subtotal row
+
+        // P-1003-CAPEX
+        ['P-1003-CAPEX', '2026-08-18', 'WBS P-1003', '500100', '45003001', 35000, 35000, 'EUR', 'EUR', 'SAP BELGIUM NV / S4HANA License', '2026', '08', 'Software License', '2026-08-18'],
+        ['P-1003-CAPEX', '2026-08-22', 'WBS P-1003', '500300', '', 1500, 1500, 'EUR', 'EUR', 'WBS Correction / Shift to CAPEX', '2026', '08', 'Accounting Adjustment', '2026-08-22'],
+        ['P-1003-CAPEX', '', '', '', '', 36500, 36500, '', '', '', '', '', '', ''] // Subtotal row
+      );
+    } else {
+      // Month 2 - September 2026 (Includes additions, late postings, new invoices, reversals)
+      rows.push(
+        // P-1001-CAPEX (M1 carryovers + new September additions)
+        ['P-1001-CAPEX', '2026-08-05', 'WBS P-1001', '500100', '45001001', 15000, 15000, 'EUR', 'EUR', 'SAP BELGIUM N / Inv 9812', '2026', '08', 'External Services', '2026-08-05'],
+        ['P-1001-CAPEX', '2026-08-12', 'WBS P-1001', '500100', '45001002', 8500, 8500, 'EUR', 'EUR', 'PLANISWARE BELGIUM SR / License A', '2026', '08', 'External Software', '2026-08-12'],
+        ['P-1001-CAPEX', '2026-09-04', 'WBS P-1001', '500100', '45001001', 7500, 7500, 'EUR', 'EUR', 'SAP BELGIUM NV / Inv 9920 - Phase 2', '2026', '09', 'External Services', '2026-09-04'], // New SAP invoice
+        ['P-1001-CAPEX', '2026-08-20', 'WBS P-1001', '500200', '', 4200, 4200, 'EUR', 'EUR', 'Reclass internal hours from OPEX to Capex', '2026', '08', 'Internal Hours Reclass', '2026-08-20'],
+        ['P-1001-CAPEX', '2026-09-15', 'WBS P-1001', '500200', '', 3100, 3100, 'EUR', 'EUR', 'Reclass internal hours from OPEX to Capex', '2026', '09', 'Internal Hours Reclass', '2026-09-15'],
+        ['P-1001-CAPEX', '', '', '', '', 38300, 38300, '', '', '', '', '', '', ''],
+
+        // P-1002-CAPEX (Includes truncated name variation + new Ernst & Young invoice)
+        ['P-1002-CAPEX', '2026-08-10', 'WBS P-1002', '500100', '45002001', 12000, 12000, 'EUR', 'EUR', 'ERNST & YOUNG CONSUL / Audit Services', '2026', '08', 'Consulting', '2026-08-10'],
+        ['P-1002-CAPEX', '2026-08-15', 'WBS P-1002', '500100', '45002002', 6000, 6000, 'EUR', 'EUR', 'FLEXSO SUPPLY CHAI / Module Config', '2026', '08', 'Implementation', '2026-08-15'],
+        ['P-1002-CAPEX', '2026-09-10', 'WBS P-1002', '500100', '45002001', 9500, 9500, 'EUR', 'EUR', 'ERNST & YOUNG CONSULTIN / Advisory Q3', '2026', '09', 'Consulting', '2026-09-10'],
+        ['P-1002-CAPEX', '', '', '', '', 27500, 27500, '', '', '', '', '', '', ''],
+
+        // P-1003-CAPEX (Includes negative reversal -2000)
+        ['P-1003-CAPEX', '2026-08-18', 'WBS P-1003', '500100', '45003001', 35000, 35000, 'EUR', 'EUR', 'SAP BELGIUM NV / S4HANA License', '2026', '08', 'Software License', '2026-08-18'],
+        ['P-1003-CAPEX', '2026-09-02', 'WBS P-1003', '500100', '45003001', -2000, -2000, 'EUR', 'EUR', 'SAP BELGIUM NV / Credit Note Overcharge', '2026', '09', 'Software License', '2026-09-02'],
+        ['P-1003-CAPEX', '2026-08-22', 'WBS P-1003', '500300', '', 1500, 1500, 'EUR', 'EUR', 'WBS Correction / Shift to CAPEX', '2026', '08', 'Accounting Adjustment', '2026-08-22'],
+        ['P-1003-CAPEX', '', '', '', '', 34500, 34500, '', '', '', '', '', '', ''],
+
+        // P-1004-CAPEX (New WBS appearing in Month 2!)
+        ['P-1004-CAPEX', '2026-09-12', 'WBS P-1004', '500100', '45004001', 14200, 14200, 'EUR', 'EUR', 'PLANISWARE BELGIUM SR / Enterprise Addon', '2026', '09', 'Software', '2026-09-12'],
+        ['P-1004-CAPEX', '', '', '', '', 14200, 14200, '', '', '', '', '', '', '']
+      );
+    }
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, 'CJI3 Extract');
+    return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  }
+
+  /**
+   * Automatically seed initial CJI3 snapshots for Month 1 (2026-08) and Month 2 (2026-09)
+   */
+  private seedInitialSnapshots() {
+    try {
+      const checkForWebAppPath = path.join(process.cwd(), 'checkforwebapp.xlsx');
+      const capexExportPath = path.join(process.cwd(), 'capex-export-CJI3.xlsx');
+      const localFilePath = fs.existsSync(checkForWebAppPath) ? checkForWebAppPath : capexExportPath;
+
+      if (fs.existsSync(localFilePath)) {
+        const filename = path.basename(localFilePath);
+        console.log(`Seeding initial database directly from ${filename}...`);
+        const fileBuf = fs.readFileSync(localFilePath);
+        const wb = XLSX.read(fileBuf, { type: 'buffer' });
+
+        const snapId = 'snap-source-excel-v1';
+        const parsed = parseCJI3Excel(fileBuf, snapId, filename, this.db.vendorAliases, 'Sheet1');
+
+        const allTransactions = parsed.detailRows;
+
+        // Collect unique projects and identify CAPEX vs OPEX
+        const projectMap = new Map<string, { wbs: string; name: string; projectType: 'CAPEX' | 'OPEX' }>();
+
+        allTransactions.forEach((tx) => {
+          const rawWbs = tx.normalizedWbs || tx.wbs;
+          if (!rawWbs) return;
+
+          const isOpex = rawWbs.startsWith('C') || rawWbs.startsWith('C7941/');
+          let baseCode = rawWbs;
+
+          if (isOpex) {
+            const parts = rawWbs.split('/');
+            if (parts.length >= 2) {
+              baseCode = parts.slice(0, 2).join('/'); // e.g., C7941/2036
+            }
+          }
+
+          if (!projectMap.has(baseCode)) {
+            const type = isOpex ? 'OPEX' : 'CAPEX';
+            const defaultTxName = tx.nameDescription
+              ? tx.nameDescription.split('/')[1] || tx.nameDescription.split('/')[0]
+              : `${type} Project ${baseCode}`;
+            const name = resolveProjectName(baseCode, defaultTxName);
+            
+            projectMap.set(baseCode, {
+              wbs: baseCode,
+              name,
+              projectType: type,
+            });
+          }
+        });
+
+        const projectList: Project[] = Array.from(projectMap.values()).map((p) => ({
+          wbs: p.wbs,
+          name: p.name,
+          projectType: p.projectType,
+          assignedPmId: 'usr-pm-sarah',
+          assignedPmName: 'Sarah Jenkins (PM)',
+          budgetEUR: 350000,
+        }));
+
+        this.db.projects = projectList;
+        this.db.transactions = allTransactions;
+
+        const snapshot: MonthlySnapshot = {
+          id: snapId,
+          reportingMonth: '2026-09',
+          version: 1,
+          status: 'COMMITTED',
+          filename,
+          uploadedBy: 'usr-admin',
+          uploadedAt: new Date().toISOString(),
+          totalRows: parsed.summary.totalRows,
+          detailRowsCount: allTransactions.length,
+          subtotalRowsCount: parsed.summary.subtotalCount,
+          wbsCount: projectList.length,
+          vendorCount: parsed.summary.vendorCount,
+          totalExternalSpend: parsed.summary.totalExternalSpend,
+          totalInternalReclass: parsed.summary.totalInternalReclass,
+          totalCorrectionTransfer: parsed.summary.totalCorrectionTransfer,
+          totalOtherNonPo: parsed.summary.totalOtherNonPo,
+        };
+
+        this.db.snapshots = [snapshot];
+        this.save();
+        console.log(`Successfully seeded ${allTransactions.length} detail transactions across ${projectList.length} WBS projects (${projectList.filter(p => p.projectType === 'OPEX').length} OPEX, ${projectList.filter(p => p.projectType === 'CAPEX').length} CAPEX).`);
+        return;
+      }
+
+      console.log('Seeding initial CJI3 monthly snapshots for Month 1 (2026-08) and Month 2 (2026-09)...');
+
+      // Month 1
+      const bufM1 = this.createSampleCJI3Buffer('2026-08');
+      const snap1Id = 'snap-2026-08-v1';
+      const parsedM1 = parseCJI3Excel(bufM1, snap1Id, 'SAP_CJI3_2026_08.xlsx', this.db.vendorAliases);
+
+      const snapshot1: MonthlySnapshot = {
+        id: snap1Id,
+        reportingMonth: '2026-08',
+        version: 1,
+        status: 'COMMITTED',
+        filename: 'SAP_CJI3_2026_08.xlsx',
+        uploadedBy: 'usr-admin',
+        uploadedAt: '2026-08-01T09:00:00.000Z',
+        totalRows: parsedM1.summary.totalRows,
+        detailRowsCount: parsedM1.summary.detailCount,
+        subtotalRowsCount: parsedM1.summary.subtotalCount,
+        wbsCount: parsedM1.summary.wbsCount,
+        vendorCount: parsedM1.summary.vendorCount,
+        totalExternalSpend: parsedM1.summary.totalExternalSpend,
+        totalInternalReclass: parsedM1.summary.totalInternalReclass,
+        totalCorrectionTransfer: parsedM1.summary.totalCorrectionTransfer,
+        totalOtherNonPo: parsedM1.summary.totalOtherNonPo,
+      };
+
+      this.db.snapshots.push(snapshot1);
+      this.db.transactions.push(...parsedM1.detailRows);
+
+      // Month 1 Closures (Processed by Sarah and David for 2026-08)
+      this.db.monthCloseConfirmations.push(
+        {
+          id: 'mc-2026-08-P1001',
+          wbs: 'P-1001-CAPEX',
+          reportingMonth: '2026-08',
+          status: 'Processed',
+          amountConfirmed: 23500,
+          vendorAmounts: { 'SAP BELGIUM NV': 15000, 'PLANISWARE BELGIUM SRL': 8500 },
+          planiswareRef: 'PLN-2026-08-1001',
+          comment: 'August CAPEX actuals entered into Planisware module.',
+          confirmedBy: 'Sarah Jenkins (PM)',
+          confirmedAt: '2026-08-15T14:30:00.000Z',
+        },
+        {
+          id: 'mc-2026-08-P1002',
+          wbs: 'P-1002-CAPEX',
+          reportingMonth: '2026-08',
+          status: 'Processed',
+          amountConfirmed: 18000,
+          vendorAmounts: { 'ERNST & YOUNG CONSULTING': 12000, 'FLEXSO SUPPLY CHAIN NV': 6000 },
+          planiswareRef: 'PLN-2026-08-1002',
+          comment: 'Consulting & partner actuals verified.',
+          confirmedBy: 'Sarah Jenkins (PM)',
+          confirmedAt: '2026-08-16T11:20:00.000Z',
+        },
+        {
+          id: 'mc-2026-08-P1003',
+          wbs: 'P-1003-CAPEX',
+          reportingMonth: '2026-08',
+          status: 'Processed',
+          amountConfirmed: 35000,
+          vendorAmounts: { 'SAP BELGIUM NV': 35000 },
+          planiswareRef: 'PLN-2026-08-1003',
+          comment: 'Initial S/4HANA software license logged.',
+          confirmedBy: 'David Chen (PM)',
+          confirmedAt: '2026-08-18T16:45:00.000Z',
+        }
+      );
+
+      // Month 2
+      const bufM2 = this.createSampleCJI3Buffer('2026-09');
+      const snap2Id = 'snap-2026-09-v1';
+      const parsedM2 = parseCJI3Excel(bufM2, snap2Id, 'SAP_CJI3_2026_09.xlsx', this.db.vendorAliases);
+
+      const snapshot2: MonthlySnapshot = {
+        id: snap2Id,
+        reportingMonth: '2026-09',
+        version: 1,
+        status: 'COMMITTED',
+        filename: 'SAP_CJI3_2026_09.xlsx',
+        uploadedBy: 'usr-admin',
+        uploadedAt: '2026-09-01T08:30:00.000Z',
+        totalRows: parsedM2.summary.totalRows,
+        detailRowsCount: parsedM2.summary.detailCount,
+        subtotalRowsCount: parsedM2.summary.subtotalCount,
+        wbsCount: parsedM2.summary.wbsCount,
+        vendorCount: parsedM2.summary.vendorCount,
+        totalExternalSpend: parsedM2.summary.totalExternalSpend,
+        totalInternalReclass: parsedM2.summary.totalInternalReclass,
+        totalCorrectionTransfer: parsedM2.summary.totalCorrectionTransfer,
+        totalOtherNonPo: parsedM2.summary.totalOtherNonPo,
+      };
+
+      this.db.snapshots.push(snapshot2);
+      this.db.transactions.push(...parsedM2.detailRows);
+
+      this.save();
+      console.log('Seeded initial CJI3 snapshots successfully!');
+    } catch (e) {
+      console.error('Failed to seed initial snapshots:', e);
+    }
+  }
+}
+
+export const store = new Store();
